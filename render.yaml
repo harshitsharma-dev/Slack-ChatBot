@@ -1,0 +1,45 @@
+# Render Blueprint for Slack AI Bot
+services:
+  # Backend Flask API
+  - type: web
+    name: slack-ai-bot-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 4 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: FLASK_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: slack-ai-bot-db
+          property: connectionString
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+    healthCheckPath: /api/health
+
+  # Frontend React App
+  - type: web
+    name: slack-ai-bot-frontend
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./build
+    envVars:
+      - key: NODE_VERSION
+        value: 18.17.0
+      - key: REACT_APP_API_URL
+        value: https://slack-ai-bot-backend.onrender.com
+
+# Database
+databases:
+  - name: slack-ai-bot-db
+    databaseName: slack_ai_bot
+    user: slack_ai_bot_user
+    plan: free
