@@ -1,57 +1,14 @@
-# Core Flask dependencies
-Flask==2.3.3
-Flask-SQLAlchemy==3.0.5
-Flask-CORS==4.0.0
-Flask-Migrate==4.0.5
-
-# Database
-psycopg2-binary==2.9.7
-SQLAlchemy==2.0.21
-
-# Environment and configuration
+flask==2.3.3
+flask-sqlalchemy==3.0.5
+flask-cors==4.0.0
 python-dotenv==1.0.0
-python-decouple==3.8
-
-# HTTP requests and API clients
-requests==2.31.0
-urllib3==2.0.4
-
-# Slack SDK
-slack-sdk==3.22.0
-slack-bolt==1.18.0
-
-# AI/LLM integration
+slack-sdk==3.21.3
 langchain==0.3.27
 langchain-google-genai==2.1.12
-langchain-core==0.3.77
-langchain-text-splitters==0.3.11
-langsmith==0.4.31
-google-ai-generativelanguage==0.7.0
-google-generativeai==0.8.5
-
-# Web server for production
+requests==2.31.0
+PyPDF2==3.0.1
+psycopg2-binary==2.9.7
+sqlalchemy==2.0.21
 gunicorn==21.2.0
-
-# Utilities
-python-dateutil==2.8.2
-pytz==2023.3
-
-# Security
-cryptography==41.0.4
-PyJWT==2.8.0
-
-# JSON handling
-jsonschema==4.19.0
-
-# Logging and monitoring
-structlog==23.1.0
-
-# Development and testing (optional but useful)
-pytest==7.4.2
-pytest-flask==1.2.0
-black==23.7.0
-flake8==6.0.0
-
-# Additional utilities for data processing
-pandas==2.1.1
 numpy==1.24.3
+pandas==2.1.1

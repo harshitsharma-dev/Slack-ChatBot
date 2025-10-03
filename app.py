@@ -11,9 +11,24 @@ from slack_sdk.signature import SignatureVerifier
 from langchain_google_genai import ChatGoogleGenerativeAI
 import json
 from datetime import datetime
+import requests
+import io
+import PyPDF2
 
 # Event deduplication to prevent duplicate processing
 processed_events = set()
+
+# PDF content cache
+pdf_content_cache = {}
+
+# Slack message cache
+slack_message_cache = []
+
+# Enhanced source routing keywords
+SQL_KEYWORDS = ['users', 'products', 'orders', 'database', 'table', 'count', 'sum', 'total', 'revenue', 'sales', 'how many', 'show me', 'list all']
+SLACK_KEYWORDS = ['said', 'mentioned', 'discussed', 'requirements', 'meeting', 'conversation', 'chat', 'message', 'who is', 'what did', 'told', 'talked about', 'summarize this', 'this pdf', 'this document']
+PDF_KEYWORDS = ['document', 'pdf', 'specification', 'manual', 'guide', 'documentation', 'procedure', 'policy', 'summarize', 'summary']
+
 import logging
 
 app = Flask(__name__, static_folder='build', static_url_path='')
@@ -83,6 +98,8 @@ class QueryLog(db.Model):
     slack_user_id = db.Column(db.String(50))
     slack_channel_id = db.Column(db.String(50))
     success = db.Column(db.Boolean, default=True)
+    source_type = db.Column(db.String(20), default='sql')
+    source_data = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class User(db.Model):
@@ -110,6 +127,29 @@ class Order(db.Model):
     total_amount = db.Column(db.Numeric(10, 2), nullable=False)
     status = db.Column(db.String(20), default='pending')
     order_date = db.Column(db.DateTime, default=datetime.utcnow)
+
+class PDFDocument(db.Model):
+    __tablename__ = 'pdf_documents'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    url = db.Column(db.Text, nullable=False)
+    description = db.Column(db.Text)
+    content_hash = db.Column(db.String(64))
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class SlackMessage(db.Model):
+    __tablename__ = 'slack_messages'
+    id = db.Column(db.Integer, primary_key=True)
+    message_ts = db.Column(db.String(50), nullable=False, unique=True)
+    user_id = db.Column(db.String(50), nullable=False)
+    username = db.Column(db.String(100))
+    channel_id = db.Column(db.String(50), nullable=False)
+    channel_name = db.Column(db.String(100))
+    text = db.Column(db.Text, nullable=False)
+    thread_ts = db.Column(db.String(50))
+    message_type = db.Column(db.String(20), default='message')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 def clean_sql(sql_text):
     """Clean SQL by removing markdown formatting and extra whitespace"""
@@ -274,8 +314,281 @@ def execute_query(sql):
         logger.error(f"Query execution error: {e}")
         return None
 
-def format_response(result, question):
-    """Format query result into human-readable response"""
+def determine_query_source(question):
+    """Legacy function - kept for backward compatibility"""
+    # This is now handled by analyze_question_for_sources
+    return 'comprehensive'
+
+def process_multi_source_query(question, channel_id):
+    """Process query from multiple sources with intelligent chaining"""
+    try:
+        print(f"\n🔍 Processing query: '{question}'")
+        
+        # Step 1: Intelligent source analysis
+        source_strategy = analyze_question_for_sources(question)
+        print(f"📊 Strategy: {source_strategy}")
+        
+        # Step 2: Execute search based on strategy
+        if source_strategy == 'SLACK_ONLY':
+            return search_slack_messages(question, channel_id)
+        elif source_strategy == 'SQL_ONLY':
+            return search_sql_database(question)
+        elif source_strategy == 'PDF_ONLY':
+            return search_pdf_documents(question)
+        elif source_strategy == 'SLACK_PDF_COMBO':
+            return search_slack_with_pdfs(question, channel_id)
+        elif source_strategy == 'MULTI_SOURCE':
+            return execute_multi_source_search(question, channel_id, ['slack', 'sql'])
+        else:  # COMPREHENSIVE
+            return execute_comprehensive_search(question, channel_id)
+            
+    except Exception as e:
+        print(f"Error in multi-source query: {e}")
+        return 'error', "I encountered an error processing your question.", None
+
+def analyze_question_for_sources(question):
+    """Analyze question to determine optimal search strategy using AI"""
+    try:
+        llm = get_gemini_llm()
+        if not llm:
+            return 'SQL_ONLY'
+        
+        analysis_prompt = f"""
+        Analyze this user question and determine the best search approach:
+        
+        QUESTION: "{question}"
+        
+        AVAILABLE DATA SOURCES:
+        1. SLACK_MESSAGES - Recent conversations, discussions, shared files, team communications
+        2. SQL_DATABASE - Structured data: users, products, orders, sales analytics
+        3. PDF_DOCUMENTS - Documentation, specifications, manuals, reports
+        
+        ANALYSIS CRITERIA:
+        - If asking about people, conversations, "who said", "what was discussed" → SLACK_ONLY
+        - If asking about data analysis, counts, sales, revenue, "how many" → SQL_ONLY  
+        - If asking about documents, PDFs, specifications, "summarize PDF" → PDF_ONLY
+        - If asking about recent files/PDFs shared in Slack → SLACK_PDF_COMBO
+        - If question needs multiple sources → MULTI_SOURCE
+        - If unclear or general → COMPREHENSIVE
+        
+        RESPOND WITH ONLY ONE OF:
+        SLACK_ONLY | SQL_ONLY | PDF_ONLY | SLACK_PDF_COMBO | MULTI_SOURCE | COMPREHENSIVE
+        """
+        
+        response = llm.invoke([("human", analysis_prompt)])
+        strategy = response.content.strip().upper()
+        
+        valid_strategies = ['SLACK_ONLY', 'SQL_ONLY', 'PDF_ONLY', 'SLACK_PDF_COMBO', 'MULTI_SOURCE', 'COMPREHENSIVE']
+        
+        if strategy in valid_strategies:
+            return strategy
+        else:
+            print(f"⚠️ Invalid strategy '{strategy}', defaulting to COMPREHENSIVE")
+            return 'COMPREHENSIVE'
+            
+    except Exception as e:
+        print(f"Error in question analysis: {e}")
+        return 'COMPREHENSIVE'
+
+def get_sources_for_strategy(strategy):
+    """Get source list for strategy"""
+    if strategy == 'slack_only':
+        return ['slack']
+    elif strategy == 'sql_only':
+        return ['sql']
+    elif strategy == 'pdf_only':
+        return ['pdf']
+    elif strategy == 'multi_source':
+        return ['slack', 'sql']
+    else:
+        return ['slack', 'sql', 'pdf']
+
+def execute_multi_source_search(question, channel_id, sources):
+    """Execute search across specified sources and combine results"""
+    results = {}
+    
+    # Search each source
+    for source in sources:
+        if source == 'slack':
+            source_type, response, data = search_slack_messages(question, channel_id)
+            if response and "couldn't find" not in response.lower():
+                results['slack'] = {'response': response, 'data': data}
+        elif source == 'sql':
+            source_type, response, data = search_sql_database(question)
+            if response and "no data found" not in response.lower():
+                results['sql'] = {'response': response, 'data': data}
+        elif source == 'pdf':
+            source_type, response, data = search_pdf_documents(question)
+            if response and "couldn't find" not in response.lower():
+                results['pdf'] = {'response': response, 'data': data}
+    
+    # Combine results intelligently
+    return combine_multi_source_results(question, results)
+
+def execute_comprehensive_search(question, channel_id):
+    """Search all sources and provide best answer"""
+    return execute_multi_source_search(question, channel_id, ['slack', 'sql', 'pdf'])
+
+def search_slack_with_pdfs(question, channel_id):
+    """Search Slack messages with focus on PDF processing"""
+    try:
+        # Get Slack messages with PDFs
+        slack_result = search_slack_messages(question, channel_id)
+        
+        # The result should already include PDF processing from find_relevant_slack_info
+        return slack_result
+        
+    except Exception as e:
+        print(f"Error in Slack PDF search: {e}")
+        return 'slack', "Error searching Slack messages with PDFs.", None
+
+def extract_pdf_files_from_slack_data(slack_data):
+    """Extract PDF files from Slack search data"""
+    try:
+        # This would extract PDF info from the slack data
+        # For now, return empty list
+        return []
+    except:
+        return []
+
+def combine_multi_source_results(question, results):
+    """Combine results from multiple sources into coherent response with improved synthesis"""
+    if not results:
+        return 'multi', "I couldn't find relevant information from any source.", None
+    
+    # Filter successful results
+    successful_results = {k: v for k, v in results.items() 
+                         if isinstance(v, tuple) and len(v) >= 2 and v[1] and "couldn't find" not in v[1].lower()}
+    
+    if not successful_results:
+        return 'multi', "I couldn't find relevant information from any source.", None
+    
+    if len(successful_results) == 1:
+        # Single source result
+        source = list(successful_results.keys())[0]
+        result = successful_results[source]
+        return result[0], result[1], result[2] if len(result) > 2 else None
+    
+    # Multiple sources - intelligent synthesis
+    try:
+        llm = get_gemini_llm()
+        if llm:
+            # Prepare context from all sources
+            context_parts = []
+            for source, result in successful_results.items():
+                if len(result) >= 2:
+                    context_parts.append(f"From {source.upper()}: {result[1]}")
+            
+            combined_context = "\n\n".join(context_parts)
+            
+            synthesis_prompt = f"""
+            MULTI-SOURCE SYNTHESIS TASK
+            
+            ORIGINAL QUESTION: "{question}"
+            
+            INFORMATION FROM MULTIPLE SOURCES:
+            {combined_context}
+            
+            TASK: Provide a comprehensive answer that synthesizes information from all sources.
+            
+            REQUIREMENTS:
+            1. Create a coherent, unified response
+            2. If sources complement each other, combine the information
+            3. If sources contradict, mention both perspectives
+            4. Prioritize the most relevant and reliable information
+            5. Keep the response concise and helpful
+            6. Don't mention "sources" explicitly - just provide the answer
+            
+            SYNTHESIZED ANSWER:
+            """
+            
+            response = llm.invoke([("human", synthesis_prompt)])
+            synthesized_answer = response.content.strip()
+            
+            return 'multi', synthesized_answer, str(successful_results)
+        else:
+            # Fallback: concatenate results
+            combined_response = "\n\n".join([f"**{source.title()}**: {result[1]}" for source, result in successful_results.items() if len(result) >= 2])
+            return 'multi', combined_response, str(successful_results)
+            
+    except Exception as e:
+        print(f"Error combining results: {e}")
+        # Fallback: return first successful result
+        first_source = list(successful_results.keys())[0]
+        first_result = successful_results[first_source]
+        return first_result[0], first_result[1], first_result[2] if len(first_result) > 2 else None
+
+def search_slack_messages(question, channel_id):
+    """Search Slack messages for relevant information with enhanced search"""
+    try:
+        print(f"Searching Slack messages for: {question}")
+        
+        # Fetch recent messages from channel
+        messages = fetch_slack_messages(channel_id, limit=100)  # Increased limit
+        
+        if not messages:
+            print("No messages found in channel")
+            return 'slack', "No recent messages found in this channel.", None
+        
+        print(f"Found {len(messages)} messages to search")
+        
+        # Use AI to find relevant messages
+        relevant_info = find_relevant_slack_info(question, messages)
+        
+        if relevant_info:
+            print(f"Found relevant info: {relevant_info[:100]}...")
+            return 'slack', relevant_info, str(messages[:10])
+        else:
+            print("No relevant information found in messages")
+            return 'slack', "I couldn't find relevant information in recent Slack messages.", None
+            
+    except Exception as e:
+        print(f"Slack search error: {e}")
+        return 'slack', "Error searching Slack messages.", None
+
+def search_pdf_documents(question):
+    """Search PDF documents for relevant information"""
+    try:
+        # Get PDF documents from database
+        pdfs = PDFDocument.query.all()
+        
+        if not pdfs:
+            return 'pdf', "No PDF documents available.", None
+        
+        # Search through PDF content
+        for pdf in pdfs:
+            content = get_pdf_content(pdf.url)
+            if content:
+                relevant_info = find_relevant_pdf_info(question, content, pdf.title)
+                if relevant_info:
+                    return 'pdf', relevant_info, pdf.url
+        
+        return 'pdf', "I couldn't find relevant information in the PDF documents.", None
+        
+    except Exception as e:
+        print(f"PDF search error: {e}")
+        return 'pdf', "Error searching PDF documents.", None
+
+def search_sql_database(question):
+    """Search SQL database using existing functionality"""
+    try:
+        sql = generate_sql_query(question)
+        if not sql:
+            return 'sql', "I couldn't understand your database question.", None
+        
+        result = execute_query(sql)
+        if result:
+            response = format_sql_response(result, question)
+            return 'sql', response, sql
+        else:
+            return 'sql', "No data found for your query.", sql
+            
+    except Exception as e:
+        print(f"SQL search error: {e}")
+        return 'sql', "Error querying database.", None
+
+def format_sql_response(result, question):
+    """Format SQL query result into human-readable response"""
     if not result:
         return "I couldn't find any data for your question."
     
@@ -293,6 +606,314 @@ def format_response(result, question):
         response += f"... and {len(result) - 5} more results"
     
     return response
+
+def fetch_slack_messages(channel_id, limit=100):
+    """Fetch recent messages from Slack channel with file attachments"""
+    try:
+        print(f"Fetching messages from channel: {channel_id}")
+        
+        response = slack_client.conversations_history(
+            channel=channel_id,
+            limit=limit
+        )
+        
+        print(f"Slack API response: {response.get('ok', False)}")
+        
+        messages = []
+        if response.get('ok') and 'messages' in response:
+            for msg in response['messages']:
+                # Include all message types except bot messages from our bot
+                if (msg.get('type') == 'message' and 
+                    msg.get('user') != 'U09HPU23ABH' and  # Skip our bot's messages
+                    not (msg.get('bot_id') == 'B09J592CGN6')):  # Skip our bot's messages
+                    
+                    username = get_username(msg.get('user', ''))
+                    text = msg.get('text', '')
+                    files = msg.get('files', [])
+                    
+                    # Process file attachments
+                    pdf_files = []
+                    for file in files:
+                        if file.get('mimetype') == 'application/pdf' or file.get('name', '').lower().endswith('.pdf'):
+                            pdf_files.append({
+                                'name': file.get('name', 'Unknown PDF'),
+                                'url': file.get('url_private_download', ''),
+                                'size': file.get('size', 0)
+                            })
+                    
+                    # Include message if it has text or PDF files
+                    if text.strip() or pdf_files:
+                        message_data = {
+                            'text': text,
+                            'user': msg.get('user', ''),
+                            'ts': msg.get('ts', ''),
+                            'username': username,
+                            'pdf_files': pdf_files
+                        }
+                        messages.append(message_data)
+        
+        print(f"Processed {len(messages)} messages")
+        return messages
+        
+    except Exception as e:
+        print(f"Error fetching Slack messages: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        return []
+
+def get_username(user_id):
+    """Get username from user ID"""
+    try:
+        response = slack_client.users_info(user=user_id)
+        return response['user']['name']
+    except:
+        return user_id
+
+def find_relevant_slack_info(question, messages):
+    """Use AI to find relevant information in Slack messages including PDF files"""
+    try:
+        if not messages:
+            return None
+        
+        # Check if question is asking about PDFs specifically
+        is_pdf_question = any(word in question.lower() for word in ['pdf', 'document', 'file', 'summarize', 'summary'])
+        
+        # Look for recent PDF files in messages
+        recent_pdfs = []
+        for msg in messages[:10]:  # Check recent messages for PDFs
+            if msg.get('pdf_files'):
+                for pdf in msg['pdf_files']:
+                    recent_pdfs.append({
+                        'name': pdf['name'],
+                        'url': pdf['url'],
+                        'username': msg['username'],
+                        'timestamp': msg['ts']
+                    })
+        
+        # If asking about PDF and we found PDFs, process them
+        if is_pdf_question and recent_pdfs:
+            return process_recent_pdfs(question, recent_pdfs)
+        
+        # Prepare enhanced context from messages
+        context_parts = []
+        for msg in messages[:30]:
+            username = msg.get('username', 'Unknown')
+            text = msg.get('text', '')
+            
+            # Include PDF file information in context
+            if msg.get('pdf_files'):
+                pdf_info = ", ".join([f"PDF: {pdf['name']}" for pdf in msg['pdf_files']])
+                text += f" [Shared files: {pdf_info}]"
+            
+            if text.strip():
+                context_parts.append(f"[{username}]: {text}")
+        
+        context = "\n".join(context_parts)
+        
+        enhanced_prompt = f"""
+        You are analyzing Slack conversation history to answer a question.
+        
+        SLACK MESSAGES:
+        {context}
+        
+        QUESTION: {question}
+        
+        INSTRUCTIONS:
+        1. Look for any mentions, discussions, or information related to the question
+        2. Pay attention to names, topics, context clues, and shared files
+        3. If you find relevant information, provide a clear, helpful answer
+        4. If no relevant information exists, respond with "No relevant information found"
+        5. Include specific details and context from the messages when possible
+        6. If PDFs or documents are mentioned, include that information
+        
+        ANSWER:
+        """
+        
+        llm = get_gemini_llm()
+        if llm:
+            response = llm.invoke([("human", enhanced_prompt)])
+            answer = response.content.strip()
+            
+            if "no relevant information found" in answer.lower() or "information not found" in answer.lower():
+                return None
+            return answer
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error finding relevant Slack info: {e}")
+        return None
+
+def process_recent_pdfs(question, recent_pdfs):
+    """Process recent PDF files from Slack messages"""
+    try:
+        print(f"Processing {len(recent_pdfs)} recent PDFs")
+        
+        pdf_summaries = []
+        for pdf in recent_pdfs[:3]:  # Process up to 3 most recent PDFs
+            print(f"Processing PDF: {pdf['name']}")
+            
+            # Download and extract PDF content
+            content = download_slack_pdf(pdf['url'])
+            if content:
+                # Summarize PDF content
+                summary = summarize_pdf_content(content, pdf['name'], question)
+                if summary:
+                    pdf_summaries.append(f"**{pdf['name']}** (shared by {pdf['username']}): {summary}")
+        
+        if pdf_summaries:
+            return "\n\n".join(pdf_summaries)
+        else:
+            return "I found PDF files in recent messages but couldn't process them."
+            
+    except Exception as e:
+        print(f"Error processing recent PDFs: {e}")
+        return "Error processing PDF files."
+
+def download_slack_pdf(url):
+    """Download PDF content from Slack private URL with improved error handling"""
+    try:
+        # Check cache first
+        if url in pdf_content_cache:
+            print(f"📋 Using cached PDF content")
+            return pdf_content_cache[url]
+        
+        headers = {
+            'Authorization': f'Bearer {os.getenv("SLACK_BOT_TOKEN")}',
+            'User-Agent': 'SlackBot/1.0'
+        }
+        
+        print(f"⬇️ Downloading PDF from: {url[:50]}...")
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            print(f"✅ Downloaded {len(response.content)} bytes")
+            
+            # Extract text using PyPDF2
+            pdf_file = io.BytesIO(response.content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            text_content = ""
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text.strip():
+                        text_content += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                except Exception as e:
+                    print(f"⚠️ Error extracting page {page_num + 1}: {e}")
+                    continue
+            
+            if text_content.strip():
+                # Cache the content
+                pdf_content_cache[url] = text_content
+                print(f"✅ Extracted {len(text_content)} characters")
+                return text_content
+            else:
+                print(f"⚠️ No text content extracted")
+                return None
+        else:
+            print(f"❌ Download failed: HTTP {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ PDF download/extraction error: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        return None
+
+def summarize_pdf_content(content, filename, question):
+    """Summarize PDF content based on the specific question"""
+    try:
+        # Limit content to avoid token limits (keep first 6000 chars)
+        content_snippet = content[:6000] if len(content) > 6000 else content
+        
+        summary_prompt = f"""
+        DOCUMENT ANALYSIS TASK
+        
+        DOCUMENT: "{filename}"
+        QUESTION: "{question}"
+        
+        DOCUMENT CONTENT:
+        {content_snippet}
+        
+        INSTRUCTIONS:
+        1. If the question asks for a summary, provide a comprehensive overview of the document
+        2. If the question is specific, answer it using information from the document
+        3. Focus on the most relevant information related to the question
+        4. Keep the response concise but informative (2-3 paragraphs max)
+        5. If the document doesn't contain relevant information, say so clearly
+        
+        RESPONSE:
+        """
+        
+        llm = get_gemini_llm()
+        if llm:
+            response = llm.invoke([("human", summary_prompt)])
+            return response.content.strip()
+        
+        return None
+        
+    except Exception as e:
+        print(f"❌ Error summarizing PDF: {e}")
+        return None
+
+def get_pdf_content(url):
+    """Extract text content from PDF URL"""
+    try:
+        # Check cache first
+        if url in pdf_content_cache:
+            return pdf_content_cache[url]
+        
+        # Download PDF
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            return None
+        
+        # Extract text using PyPDF2
+        pdf_file = io.BytesIO(response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        
+        # Cache the content
+        pdf_content_cache[url] = text
+        return text
+        
+    except Exception as e:
+        print(f"Error extracting PDF content: {e}")
+        return None
+
+def find_relevant_pdf_info(question, content, title):
+    """Use AI to find relevant information in PDF content"""
+    try:
+        # Limit content to avoid token limits
+        content_snippet = content[:3000] if len(content) > 3000 else content
+        
+        prompt = f"""
+        Based on this document "{title}":
+        {content_snippet}
+        
+        Answer this question: {question}
+        
+        If the information is not available in the document, say "Information not found in document".
+        """
+        
+        llm = get_gemini_llm()
+        if llm:
+            response = llm.invoke([("human", prompt)])
+            answer = response.content.strip()
+            
+            if "information not found" in answer.lower():
+                return None
+            return f"From {title}: {answer}"
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error finding relevant PDF info: {e}")
+        return None
 
 @app.route('/slack/events', methods=['POST'])
 def slack_events():
@@ -404,18 +1025,10 @@ def handle_mention(event):
             print("No meaningful text after cleaning, returning")
             return
         
-        print(f"Generating SQL for: '{text}'")
-        # Generate and execute SQL
-        sql = generate_sql_query(text)
-        print(f"Generated SQL: '{sql}'")
-        
-        if not sql:
-            response = "I couldn't understand your question. Please try rephrasing it."
-        else:
-            print(f"Executing SQL: '{sql}'")
-            result = execute_query(sql)
-            print(f"Query result: {result}")
-            response = format_response(result, text)
+        print(f"Processing multi-source query: '{text}'")
+        # Determine source and process query
+        source_type, response, source_data = process_multi_source_query(text, channel_id)
+        print(f"Source: {source_type}, Response: {response[:100]}...")
         
         print(f"Final response: '{response}'")
         
@@ -423,11 +1036,12 @@ def handle_mention(event):
         try:
             log = QueryLog(
                 user_question=text,
-                generated_sql=sql,
                 bot_response=response,
                 slack_user_id=user_id,
                 slack_channel_id=channel_id,
-                success=sql is not None and result is not None
+                success=response != "I couldn't find relevant information.",
+                source_type=source_type,
+                source_data=source_data
             )
             db.session.add(log)
             db.session.commit()
@@ -471,57 +1085,65 @@ def get_queries():
 
 @app.route('/api/query', methods=['POST'])
 def test_query():
-    """Test query endpoint"""
-    print("\n" + "="*50)
-    print("API ENDPOINT /api/query HIT!")
-    print("="*50)
-    
+    """Test multi-source query endpoint"""
     try:
-        print(f"Request method: {request.method}")
-        print(f"Request headers: {dict(request.headers)}")
-        print(f"Request data: {request.get_data()}")
-        
         data = request.json
-        print(f"Parsed JSON data: {data}")
-        
         question = data.get('question') if data else None
-        print(f"Extracted question: '{question}'")
         
         if not question:
-            print("ERROR: No question provided")
             return jsonify({"error": "Question is required"}), 400
         
-        print(f"\n=== CALLING generate_sql_query with: '{question}' ===")
-        sql = generate_sql_query(question)
-        print(f"\n=== generate_sql_query RETURNED: '{sql}' ===")
+        # Process multi-source query
+        source_type, response, source_data = process_multi_source_query(question, 'test_channel')
         
-        if not sql:
-            print("ERROR: No SQL generated, returning error")
-            return jsonify({"error": "Could not generate SQL"}), 400
-        
-        print(f"\n=== EXECUTING SQL: '{sql}' ===")
-        result = execute_query(sql)
-        print(f"=== QUERY RESULT: {result} ===")
-        
-        response = format_response(result, question)
-        print(f"=== FORMATTED RESPONSE: '{response}' ===")
-        
-        final_response = {
+        return jsonify({
             "question": question,
-            "sql": sql,
+            "source_type": source_type,
             "response": response,
-            "success": result is not None,
-            "raw_data": result if result else []
-        }
-        print(f"=== FINAL API RESPONSE: {final_response} ===")
-        
-        return jsonify(final_response)
+            "success": response != "I couldn't find relevant information.",
+            "source_data": source_data,
+            "raw_data": [] if source_type != 'sql' else source_data
+        })
         
     except Exception as e:
-        print(f"\nERROR in test_query endpoint: {str(e)}")
-        import traceback
-        print(f"Full traceback: {traceback.format_exc()}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route('/api/pdf-documents', methods=['GET', 'POST'])
+def manage_pdf_documents():
+    """Manage PDF documents"""
+    if request.method == 'GET':
+        pdfs = PDFDocument.query.all()
+        return jsonify([{
+            'id': pdf.id,
+            'title': pdf.title,
+            'url': pdf.url,
+            'description': pdf.description,
+            'created_at': pdf.created_at.isoformat()
+        } for pdf in pdfs])
+    
+    elif request.method == 'POST':
+        data = request.json
+        pdf = PDFDocument(
+            title=data.get('title'),
+            url=data.get('url'),
+            description=data.get('description', '')
+        )
+        db.session.add(pdf)
+        db.session.commit()
+        return jsonify({'success': True, 'id': pdf.id})
+
+@app.route('/api/slack-messages/<channel_id>')
+def get_slack_messages(channel_id):
+    """Get recent Slack messages for a channel"""
+    try:
+        messages = fetch_slack_messages(channel_id)
+        return jsonify({
+            'success': True,
+            'messages': messages[:10],
+            'count': len(messages)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/stats')
 def get_stats():
